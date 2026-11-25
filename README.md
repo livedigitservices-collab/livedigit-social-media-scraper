@@ -62,8 +62,6 @@ docker run --rm -p 127.0.0.1:8501:8501 --env-file .env \
   -e DB_PATH=/data/leads.sqlite3 -v livedigit-data:/data livedigit-lead-finder
 ```
 
-If your build runs behind a managed HTTPS proxy, pass its trusted CA bundle to Docker BuildKit using `--secret id=pip_ca,src=/path/to/trusted-ca-bundle.pem` on the build command.
-
 The container binds to `0.0.0.0:${PORT}`. Check readiness using `GET /_stcore/health`. The named volume retains leads, history, and usage across container restarts.
 
 ## Railway-compatible deployment
