@@ -78,6 +78,7 @@ class Search:
     variants: int = 1
     lookup_limit: int = 5
     profile_limit: int = 1000
+    contact_lookups: int = 0
 
     @property
     def local_city(self):
@@ -113,7 +114,7 @@ class Search:
                         yield row
 
     def estimated_requests(self):
-        return len(list(self.queries())) * self.pages + (self.lookup_limit if self.discover_websites else 0)
+        return len(list(self.queries())) * self.pages + (self.lookup_limit if self.discover_websites else 0) + self.contact_lookups
 
 
 class Serper:
@@ -180,6 +181,32 @@ def discover_website(serper, search_id, name, city, local_city):
     return ""
 
 
+CONTACT_GOAL = 40
+
+
+def find_public_listing(serper, search_id, spec, candidate):
+    # Search the local business name, then require an unambiguous exact-name listing.
+    name = re.sub(r"[^\w &.-]", " ", candidate.name).strip()[:100]
+    if len(business_key(name)) < 6:
+        return None
+    results = serper.search(search_id, f"{name} {spec.city} {spec.state}", "English", 1, places=True)
+    matches = {}
+    for item in results:
+        if not isinstance(item, dict) or business_key(result_text(item, "title")) != business_key(candidate.name):
+            continue
+        listing, _ = inspect_place(item, spec.city, spec.local_city)
+        if listing:
+            matches[listing.url] = listing
+    if len(matches) != 1:
+        return None
+    listing = next(iter(matches.values()))
+    known_site = website_domain(candidate.website).removeprefix("www.")
+    listed_site = website_domain(listing.website).removeprefix("www.")
+    if known_site and listed_site and known_site != listed_site:
+        return None
+    return listing if listing.contact.has_number else None
+
+
 def contact_row(record, link):
     return dict(mobile=record.mobile, whatsapp=record.whatsapp, email=record.email,
                 landline=record.landline, source=link, landline_source=link,
@@ -193,7 +220,7 @@ def run_search(spec, settings, store, progress=lambda message, done, total: None
             or not spec.platforms or any(p not in (*SOCIAL, MAPS) for p in spec.platforms)
             or not spec.languages or any(lang not in LANGUAGES for lang in spec.languages)
             or not 1 <= spec.pages <= 10 or not 1 <= spec.variants <= 8 or not 0 <= spec.lookup_limit <= 20
-            or not 1 <= spec.profile_limit <= 1000):
+            or not 1 <= spec.profile_limit <= 1000 or not 0 <= spec.contact_lookups <= 40):
         raise SearchError("Choose a valid mode, category, city, language and page budget.")
     serper = serper or Serper(settings, store)
     reader = reader or WebsiteReader(settings.domains)
@@ -201,11 +228,21 @@ def run_search(spec, settings, store, progress=lambda message, done, total: None
     total = len(queries) * spec.pages
     description = " · ".join((spec.city, spec.state, spec.category, ", ".join(spec.platforms),
                               ", ".join(spec.languages), f"{spec.pages} page(s)", spec.keyword or "Default keywords"))
+    if spec.contact_lookups:
+        description += f" · Target {CONTACT_GOAL} businesses with numbers"
     search_id = store.start(description)
     diagnostics = Counter(raw=0, api_errors=0)
     accepted = set()
     pending = []
     enrichable = {}
+    social_candidates = {}
+    discovery_requests = 0
+    discovery_budget = total
+    if spec.contact_lookups:
+        remaining = max(0, settings.credit_limit - store.today()[1])
+        # Keep some credits available for contacts even when a bulk plan has many pages.
+        reserved = min(spec.contact_lookups, remaining // 2)
+        discovery_budget = min(total, remaining - reserved)
     remaining_lookups = spec.lookup_limit if spec.discover_websites else 0
     status = "Completed"
     completed = 0
@@ -254,7 +291,42 @@ def run_search(spec, settings, store, progress=lambda message, done, total: None
             enrichable[candidate.url] = (lead, candidate, platform)
         else:
             enrichable.pop(candidate.url, None)
+        if duplicate is not None and platform in SOCIAL:
+            social_candidates[candidate.url] = (lead, candidate, platform)
         return True
+
+    def social_contacts():
+        return [row for row in store.rows(search_id, contacts_only=True) if row["instagram"] or row["facebook"]]
+
+    def enrich_social_contacts():
+        nonlocal provider_notice
+        covered = social_contacts()
+        used = 0
+        queries_tried = set()
+        for url, (lead, candidate, platform) in social_candidates.items():
+            if len(covered) >= CONTACT_GOAL or used >= spec.contact_lookups:
+                break
+            link_field = "instagram" if platform == "Instagram" else "facebook"
+            identity = business_key(candidate.name)
+            if (candidate.contact.has_number or identity in queries_tried or len(identity) < 6
+                    or any(row[link_field] == url for row in covered)):
+                continue
+            queries_tried.add(identity)
+            used += 1
+            progress(f"Looking for a public number for {candidate.name} · {len(covered)}/{CONTACT_GOAL} found", completed, total)
+            try:
+                listing = find_public_listing(serper, search_id, spec, candidate)
+            except ProviderError as exc:
+                diagnostics["api_errors"] += 1
+                provider_notice = str(exc)
+                if exc.stop:
+                    raise
+                continue
+            if listing:
+                updated = {**lead, "maps": listing.url, "website": lead["website"] or listing.website}
+                updated.update(contact_fields([lead, contact_row(listing.contact, listing.source)]))
+                store.save(search_id, updated, platform, url, settings.daily_target, count_duplicate=False)
+                covered = social_contacts()
 
     def enrich_missing_websites():
         nonlocal remaining_lookups, provider_notice
@@ -280,9 +352,14 @@ def run_search(spec, settings, store, progress=lambda message, done, total: None
 
     try:
         for platform, language, query in queries:
+            if discovery_requests >= discovery_budget:
+                break
             seen_pages = set()
             for page in range(1, spec.pages + 1):
+                if discovery_requests >= discovery_budget:
+                    break
                 progress(f"Searching {platform} in {language}, page {page}", completed, total)
+                discovery_requests += 1
                 try:
                     if platform == MAPS:
                         results = serper.search(search_id, query, language, page, places=True)
@@ -319,12 +396,16 @@ def run_search(spec, settings, store, progress=lambda message, done, total: None
                     elif not process(candidate, platform):
                         pending.append((candidate, platform))
                 completed += 1
+                if spec.contact_lookups and len(social_contacts()) >= CONTACT_GOAL:
+                    discovery_budget = discovery_requests
                 if stop:
                     raise stop
         for candidate, platform in pending:
             if not process(candidate, platform):
                 reject("Missing corroboration for requested locality")
         pending.clear()
+        if spec.contact_lookups and not stop:
+            enrich_social_contacts()
         if remaining_lookups and not stop:
             enrich_missing_websites()
     except LimitReached as exc:
@@ -343,6 +424,8 @@ def run_search(spec, settings, store, progress=lambda message, done, total: None
         finally:
             if provider_notice and status == "Completed":
                 status = f"Partial · {provider_notice}"
+            if spec.contact_lookups:
+                diagnostics["contact_goal_found"] = len(social_contacts())
             diagnostics["accepted"] = len(accepted)
             store.finish(search_id, status, len(accepted), diagnostics)
     progress(status, total if status == "Completed" else completed, total)

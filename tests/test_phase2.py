@@ -193,3 +193,50 @@ def test_bulk_search_stops_after_1000_unique_profiles(tmp_path):
     assert "1,000 profiles reached" in status
     assert len(provider.calls) == 100
     assert store.diagnostics(search_id)["accepted"] == len(store.rows(search_id)) == 1000
+
+
+def test_contact_target_reserves_credits_and_enriches_only_unique_matches(tmp_path):
+    store = Store(tmp_path / "contacts.sqlite3")
+    settings = Settings("mock-key", credit_limit=4, interval=0)
+    social = [
+        {"title": name, "link": f"https://instagram.com/{slug}/", "snippet": "Hyderabad clinic"}
+        for name, slug in (("Jasmine Clinic", "jasmine"), ("Lotus Clinic", "lotus"),
+                           ("Other Clinic", "other"))
+    ]
+    def place(name, cid):
+        return {"title": name, "address": "Hyderabad, Telangana", "phoneNumber": "+91 (40) 2345 6789", "cid": cid}
+
+    provider = Provider(
+        Reply({"organic": social}), Reply({"organic": []}),
+        Reply({"places": [place("Jasmine Clinic", "123")]}),
+        Reply({"places": [place("Lotus Clinic", "456"), place("Lotus Clinic", "789")]}),
+    )
+    spec = Search("Telangana", "Hyderabad", "Clinics", ("Instagram",), ("English",),
+                  pages=5, contact_lookups=2)
+    assert spec.estimated_requests() == 7
+    search_id, _ = run_search(spec, settings, store, serper=Serper(settings, store, provider))
+    assert [url for url, _ in provider.calls] == [SERPER_URL, SERPER_URL, PLACES_URL, PLACES_URL]
+    assert len(store.rows(search_id)) == 3
+    lead, = store.rows(search_id, contacts_only=True)
+    assert lead["instagram"].endswith("/jasmine/")
+    assert lead["landline"] == "+914023456789"
+    assert lead["landline_source"] == "https://www.google.com/maps?cid=123"
+    assert not lead["whatsapp"]
+    assert store.diagnostics(search_id)["contact_goal_found"] == 1
+
+
+def test_contact_target_stops_discovery_when_forty_numbers_are_found(tmp_path):
+    store = Store(tmp_path / "contacts.sqlite3")
+    settings = Settings("mock-key", credit_limit=20, interval=0)
+    provider = Provider(*[
+        Reply({"organic": [
+            {"title": f"Clinic {n}", "link": f"https://instagram.com/clinic{n}/",
+             "snippet": f"Hyderabad clinic | Phone: 600000{n:04d}"}
+            for n in range(first, first + 10)
+        ]}) for first in (0, 10, 20, 30)
+    ])
+    spec = Search("Telangana", "Hyderabad", "Clinics", ("Instagram",), ("English",),
+                  pages=5, contact_lookups=10)
+    search_id, _ = run_search(spec, settings, store, serper=Serper(settings, store, provider))
+    assert len(provider.calls) == 4
+    assert store.diagnostics(search_id)["contact_goal_found"] == 40

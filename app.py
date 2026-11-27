@@ -9,7 +9,7 @@ import streamlit as st
 
 from livedigit.discovery import CATEGORIES, LOCATIONS
 from livedigit.export import csv_bytes, excel_bytes, table
-from livedigit.search import LANGUAGES, MODES, Search, SearchError, Settings, run_search
+from livedigit.search import CONTACT_GOAL, LANGUAGES, MODES, Search, SearchError, Settings, run_search
 from livedigit.store import Store
 
 st.set_page_config(page_title="LiveDigit Social Media Lead Finder", page_icon="📍", layout="wide")
@@ -42,7 +42,7 @@ def clear_filters():
     for key in ("search_state", "search_city", "search_custom_city", "search_category", "search_mode",
                 "search_languages", "search_keyword", "search_variants", "search_pages", "search_lookup",
                 "search_lookup_limit", "bulk_search", "bulk_variants", "bulk_pages", "contacts_only",
-                "lead_view", "results_source"):
+                "lead_view", "results_source", "contact_goal", "contact_lookup_budget"):
         st.session_state.pop(key, None)
 
 
@@ -65,14 +65,22 @@ with st.sidebar:
     lookup = st.checkbox("Look up missing official websites", key="search_lookup")
     lookup_limit = (st.slider("Maximum additional website lookups", 1, 20, 5, key="search_lookup_limit")
                     if lookup else 0)
+    contacts = mode != "Google Maps businesses" and st.checkbox(
+        f"Target {CONTACT_GOAL} social leads with public numbers", key="contact_goal",
+    )
+    contact_budget = (st.slider("Maximum additional business listing requests", 1, 40, 20, key="contact_lookup_budget")
+                      if contacts else 0)
     spec = Search(state, custom_city.strip(), category, MODES[mode], tuple(languages),
-                  keyword.strip(), pages, lookup, variants, lookup_limit)
+                  keyword.strip(), pages, lookup, variants, lookup_limit, contact_lookups=contact_budget)
     remaining = max(0, settings.credit_limit - store.today()[1])
     ready = bool(spec.city and spec.languages)
     if ready:
         estimated = spec.estimated_requests()
         st.caption(f"Estimated upper bound {estimated} request credits, with {remaining} remaining today. "
                    "Empty or repeated pages can reduce usage.")
+        if contacts:
+            st.caption("Search reserves some remaining credits for matching public business listings. "
+                       "The contact target depends on what those listings publish.")
         if bulk:
             st.caption("Bulk search can take several minutes. It stops at 1,000 accepted profiles, "
                        "the daily limit, or the end of available results.")
@@ -96,8 +104,11 @@ if submitted:
         search_id, status = run_search(spec, settings, store, progress)
         st.session_state["diagnostic_view"] = search_id
         st.session_state["lead_view"] = search_id
-        st.session_state["contacts_only"] = False
+        st.session_state["contacts_only"] = bool(spec.contact_lookups)
         st.session_state["results_source"] = "All sources"
+        if spec.contact_lookups:
+            found = store.diagnostics(search_id).get("contact_goal_found", 0)
+            st.info(f"{found} social businesses with a public number found toward the target of {CONTACT_GOAL}.")
         if status == "Completed":
             st.success("Search complete.")
         else:
