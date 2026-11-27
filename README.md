@@ -37,6 +37,8 @@ Open the address printed by Streamlit. Pick a state, city, category, and languag
 
 Each Search or Places page and optional website lookup reserves one estimated request credit. Empty or repeated pages end pagination for that query. The dashboard counts attempted requests, including provider errors, and does not know the account balance or final billing. Limits reset at midnight India time. The 1,000-profile target is a ceiling across profile and listing URLs. Reaching it depends on the request limit, result supply, and deduplication. Searches are user-triggered.
 
+For Instagram or Facebook, enable **Target 40 social leads with public numbers** to reserve part of the available daily credits for Serper Places lookups. Each lookup checks a discovered business by name and city, skips ambiguous listings and conflicting website evidence, and records the listing URL for any imported public number. Preview the additional request budget before running. The target depends on available contacts, search coverage, and credits.
+
 Open **Search diagnostics** for raw, accepted and rejected result counts, rejection reasons, API errors, actual attempted requests, and the share of deduplicated businesses linked to the run that currently have a number. Accepted counts are unique profile or listing URLs within the run. Rejected counts include repeated results. Optional website lookup results are excluded from raw discovery counts. Phase 1 runs have no recorded raw result or rejection history.
 
 ## Phase 1 production investigation
