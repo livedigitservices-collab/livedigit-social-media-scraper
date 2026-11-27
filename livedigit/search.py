@@ -23,6 +23,7 @@ MODES = {
     "Facebook businesses": ("Facebook",),
     "Google Maps businesses": (MAPS,),
     "Combined business search": (MAPS, "Instagram", "Facebook"),
+    "Instagram + Facebook businesses": ("Instagram", "Facebook"),
 }
 LANGUAGES = ("English", "Telugu")
 
@@ -76,6 +77,7 @@ class Search:
     discover_websites: bool = False
     variants: int = 1
     lookup_limit: int = 5
+    profile_limit: int = 1000
 
     @property
     def local_city(self):
@@ -83,6 +85,7 @@ class Search:
 
     def queries(self):
         keywords = CATEGORIES[self.category]
+        emitted = set()
         for variant in range(self.variants):
             for platform in self.platforms:
                 for language in self.languages:
@@ -93,13 +96,21 @@ class Search:
                         state = STATE_TELUGU[self.state]
                     else:
                         terms = (keywords[0], *keywords[2:])
-                        locations = (self.city, *CITY_VARIANTS.get(self.city, ()), self.local_city)
+                        locations = (self.city, *(alias for alias in CITY_VARIANTS.get(self.city, ()) if alias.isascii()))
+                        if platform in SOCIAL and self.category == "Home services":
+                            terms = (*keywords[2:], keywords[0])
                         state = self.state
                     city = locations[variant % len(locations)]
-                    query = f"{terms[variant % len(terms)]} {city} {state} {self.keyword}".strip()
+                    if platform in SOCIAL and variant >= len(terms) and len(locations) == 1:
+                        # A shorter metro query is a useful second pass when business snippets omit the state.
+                        state = ""
+                    query = " ".join(part for part in (terms[variant % len(terms)], city, state, self.keyword) if part)
                     if platform in SOCIAL:
                         query = f"site:{SOCIAL[platform]} {query}"
-                    yield platform, language, query
+                    row = platform, language, query
+                    if row not in emitted:
+                        emitted.add(row)
+                        yield row
 
     def estimated_requests(self):
         return len(list(self.queries())) * self.pages + (self.lookup_limit if self.discover_websites else 0)
@@ -181,7 +192,8 @@ def run_search(spec, settings, store, progress=lambda message, done, total: None
     if (spec.state not in LOCATIONS or spec.category not in CATEGORIES or not spec.city.strip()
             or not spec.platforms or any(p not in (*SOCIAL, MAPS) for p in spec.platforms)
             or not spec.languages or any(lang not in LANGUAGES for lang in spec.languages)
-            or not 1 <= spec.pages <= 5 or not 1 <= spec.variants <= 3 or not 0 <= spec.lookup_limit <= 20):
+            or not 1 <= spec.pages <= 10 or not 1 <= spec.variants <= 8 or not 0 <= spec.lookup_limit <= 20
+            or not 1 <= spec.profile_limit <= 1000):
         raise SearchError("Choose a valid mode, category, city, language and page budget.")
     serper = serper or Serper(settings, store)
     reader = reader or WebsiteReader(settings.domains)
@@ -224,6 +236,10 @@ def run_search(spec, settings, store, progress=lambda message, done, total: None
             {**lead, **contact_row(candidate.contact, candidate.source)}, platform
         ):
             return False
+        if len(accepted) >= spec.profile_limit and candidate.url not in accepted:
+            reject("Per-search profile target reached")
+            stop = stop or LimitReached(f"Per-search target of {spec.profile_limit:,} profiles reached.")
+            return True
         duplicate = save(lead, candidate, platform)
         if duplicate is None:
             reject("Daily new-profile cap reached")
@@ -232,6 +248,8 @@ def run_search(spec, settings, store, progress=lambda message, done, total: None
             reject("Repeated profile or listing URL")
         else:
             accepted.add(candidate.url)
+            if len(accepted) == spec.profile_limit:
+                stop = stop or LimitReached(f"Per-search target of {spec.profile_limit:,} profiles reached.")
         if duplicate is not None and not candidate.website:
             enrichable[candidate.url] = (lead, candidate, platform)
         else:

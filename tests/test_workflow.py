@@ -128,9 +128,13 @@ def test_streamlit_search_and_results(tmp_path, monkeypatch):
     app.selectbox(key="search_mode").set_value("Instagram businesses")
     app.multiselect[0].set_value(["English"])
     app.slider[0].set_value(1)
-    app.button[0].click().run()
+    app.toggle(key="contacts_only").set_value(True)
+    app.selectbox(key="results_source").set_value("Facebook")
+    app.button(key="run_search").click().run()
     assert not app.exception
     assert len(session.calls) == 1
+    assert not app.toggle(key="contacts_only").value
+    assert app.selectbox(key="results_source").value == "All sources"
     assert app.metric[0].value == "1"
     assert any("Business name" in grid.value and grid.value.iloc[0]["Business name"] == "Jasmine Cafe"
                for grid in app.dataframe)
@@ -157,3 +161,23 @@ def test_railway_requires_dashboard_password(tmp_path, monkeypatch):
     assert not app.exception
     assert "DASHBOARD_PASSWORD" in app.error[0].value
     assert not app.metric
+
+
+def test_clear_filters_resets_inputs_and_result_view(tmp_path, monkeypatch):
+    monkeypatch.delenv("SERPER_API_KEY", raising=False)
+    monkeypatch.delenv("DASHBOARD_PASSWORD", raising=False)
+    monkeypatch.delenv("RAILWAY_ENVIRONMENT_ID", raising=False)
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "app.sqlite3"))
+    app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "app.py")).run()
+    app.selectbox(key="search_mode").set_value("Facebook businesses")
+    app.text_input(key="search_keyword").set_value("repair")
+    app.toggle(key="contacts_only").set_value(True)
+    app.checkbox(key="bulk_search").set_value(True)
+    app.run()
+    assert app.slider(key="bulk_pages").value == 10
+    app.button(key="clear_filters").click().run()
+    assert not app.exception
+    assert app.selectbox(key="search_mode").value == "Instagram + Facebook businesses"
+    assert app.text_input(key="search_keyword").value == ""
+    assert not app.checkbox(key="bulk_search").value
+    assert not app.toggle(key="contacts_only").value

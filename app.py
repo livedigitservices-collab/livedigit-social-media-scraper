@@ -38,34 +38,51 @@ except (ValueError, OSError, sqlite3.Error):
     st.error("Could not initialize the dashboard. Check the configured limits and SQLite path.")
     st.stop()
 
+def clear_filters():
+    for key in ("search_state", "search_city", "search_custom_city", "search_category", "search_mode",
+                "search_languages", "search_keyword", "search_variants", "search_pages", "search_lookup",
+                "search_lookup_limit", "bulk_search", "bulk_variants", "bulk_pages", "contacts_only",
+                "lead_view", "results_source"):
+        st.session_state.pop(key, None)
+
+
 with st.sidebar:
     st.header("Search filters")
-    state = st.selectbox("State", list(LOCATIONS))
-    city = st.selectbox("City", [*LOCATIONS[state], "Custom location"])
-    custom_city = st.text_input("Custom city or town", max_chars=80) if city == "Custom location" else city
-    category = st.selectbox("Business category", list(CATEGORIES))
-    mode = st.selectbox("Search mode", list(MODES), index=3, key="search_mode")
-    languages = st.multiselect("Languages", LANGUAGES, default=LANGUAGES)
-    keyword = st.text_input("Custom keyword", max_chars=100)
-    variants = st.slider("Query variants per source and language", 1, 3, 2)
-    pages = st.slider("Pages per query", 1, 5, 1)
-    lookup = st.checkbox("Look up missing official websites")
-    lookup_limit = st.slider("Maximum additional website lookups", 1, 20, 5) if lookup else 0
+    st.button("Clear filters", on_click=clear_filters, key="clear_filters")
+    state = st.selectbox("State", list(LOCATIONS), key="search_state")
+    city = st.selectbox("City", [*LOCATIONS[state], "Custom location"], key="search_city")
+    custom_city = (st.text_input("Custom city or town", max_chars=80, key="search_custom_city")
+                   if city == "Custom location" else city)
+    category = st.selectbox("Business category", list(CATEGORIES), key="search_category")
+    mode = st.selectbox("Search mode", list(MODES), index=4, key="search_mode")
+    languages = st.multiselect("Languages", LANGUAGES, default=LANGUAGES, key="search_languages")
+    keyword = st.text_input("Custom keyword", max_chars=100, key="search_keyword")
+    bulk = st.checkbox("Bulk search (up to 1,000 profiles)", key="bulk_search")
+    variants = st.slider("Query variants per source and language", 1, 8 if bulk else 3, 8 if bulk else 2,
+                         key="bulk_variants" if bulk else "search_variants")
+    pages = st.slider("Pages per query", 1, 10 if bulk else 5, 10 if bulk else 1,
+                      key="bulk_pages" if bulk else "search_pages")
+    lookup = st.checkbox("Look up missing official websites", key="search_lookup")
+    lookup_limit = (st.slider("Maximum additional website lookups", 1, 20, 5, key="search_lookup_limit")
+                    if lookup else 0)
     spec = Search(state, custom_city.strip(), category, MODES[mode], tuple(languages),
                   keyword.strip(), pages, lookup, variants, lookup_limit)
+    remaining = max(0, settings.credit_limit - store.today()[1])
     ready = bool(spec.city and spec.languages)
     if ready:
         estimated = spec.estimated_requests()
-        remaining = max(0, settings.credit_limit - store.today()[1])
         st.caption(f"Estimated upper bound {estimated} request credits, with {remaining} remaining today. "
                    "Empty or repeated pages can reduce usage.")
+        if bulk:
+            st.caption("Bulk search can take several minutes. It stops at 1,000 accepted profiles, "
+                       "the daily limit, or the end of available results.")
         with st.expander("Preview search queries"):
             st.dataframe(
                 [{"Source": platform, "Language": language, "Query": query}
                  for platform, language, query in spec.queries()],
                 hide_index=True, width="stretch",
             )
-    submitted = st.button("Find businesses", type="primary", disabled=not (settings.key and ready))
+    submitted = st.button("Find businesses", type="primary", disabled=not (settings.key and ready and remaining), key="run_search")
     if not settings.key:
         st.info("Add SERPER_API_KEY in your environment to enable searches.")
 
@@ -79,6 +96,8 @@ if submitted:
         search_id, status = run_search(spec, settings, store, progress)
         st.session_state["diagnostic_view"] = search_id
         st.session_state["lead_view"] = search_id
+        st.session_state["contacts_only"] = False
+        st.session_state["results_source"] = "All sources"
         if status == "Completed":
             st.success("Search complete.")
         else:
@@ -107,8 +126,14 @@ with results_tab:
     if st.session_state.get("lead_view") not in options:
         st.session_state["lead_view"] = 0
     search_id = st.selectbox("Results from", list(options), format_func=options.get, key="lead_view")
-    contacts_only = st.toggle("Only businesses with a contact number")
-    frame = table(store.rows(search_id or None, contacts_only))
+    source_fields = {"Instagram": "instagram", "Facebook": "facebook", "Google Maps": "maps"}
+    source = st.selectbox("Filter by profile or listing", ["All sources", *source_fields], key="results_source")
+    contacts_only = st.toggle("Only businesses with a contact number", key="contacts_only")
+    rows = store.rows(search_id or None, contacts_only)
+    if source in source_fields:
+        rows = [row for row in rows if row[source_fields[source]]]
+    st.caption(f"{len(rows):,} businesses in this view")
+    frame = table(rows)
     if frame.empty:
         st.info("No businesses match this view.")
     else:

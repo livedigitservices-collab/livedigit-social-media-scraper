@@ -148,3 +148,48 @@ def test_distinct_places_can_share_a_business_phone(tmp_path):
     search_id, status = run_search(spec, settings, store, serper=Serper(settings, store, provider))
     assert status == "Completed"
     assert len(store.rows(search_id, contacts_only=True)) == 2
+
+
+def test_social_home_services_queries_and_handle_evidence():
+    from livedigit.discovery import inspect_social
+
+    spec = Search("Telangana", "Hyderabad", "Home services", MODES["Instagram + Facebook businesses"],
+                  ("English",), variants=3)
+    queries = list(spec.queries())
+    assert len(queries) == 6
+    for host in ("instagram.com", "facebook.com"):
+        assert {(source_query.split()[1]) for _, _, source_query in queries if host in source_query} == {
+            "plumber", "electrician", "appliance",
+        }
+    result, reason = inspect_social(
+        {"title": "Ravi", "link": "https://instagram.com/ravi_plumber_hyderabad", "snippet": "Call for bookings"},
+        "Instagram", "Home services", "Hyderabad", "హైదరాబాద్", "",
+    )
+    assert not reason and result.location_confirmed
+    assert profile_url("https://www.facebook.com/p/Jasmine-Cafe-12345678/", "Facebook").endswith("id=12345678")
+
+
+def test_bulk_search_stops_after_1000_unique_profiles(tmp_path):
+    store = Store(tmp_path / "bulk.sqlite3")
+    settings = Settings("mock-key", credit_limit=200, daily_target=2000, interval=0)
+
+    class BulkProvider(Provider):
+        def post(self, url, **kwargs):
+            assert url == SERPER_URL
+            query = kwargs["json"]["q"]
+            domain = "facebook.com" if query.startswith("site:facebook.com") else "instagram.com"
+            start = len(self.calls) * 10
+            self.calls.append((url, kwargs["json"]))
+            return Reply({"organic": [
+                {"title": f"Plumber {index}", "link": f"https://{domain}/plumber{index}",
+                 "snippet": "Hyderabad plumbing services"}
+                for index in range(start, start + 10)
+            ]})
+
+    provider = BulkProvider()
+    spec = Search("Telangana", "Hyderabad", "Home services", MODES["Instagram + Facebook businesses"],
+                  ("English",), pages=10, variants=8)
+    search_id, status = run_search(spec, settings, store, serper=Serper(settings, store, provider))
+    assert "1,000 profiles reached" in status
+    assert len(provider.calls) == 100
+    assert store.diagnostics(search_id)["accepted"] == len(store.rows(search_id)) == 1000

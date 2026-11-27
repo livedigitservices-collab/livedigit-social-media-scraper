@@ -31,7 +31,7 @@ CATEGORIES = {
     "Retail": ("shop", "దుకాణం", "store", "boutique"),
     "Clinics": ("clinic", "క్లినిక్", "dental", "hospital"),
     "Fitness": ("gym", "జిమ్", "fitness"),
-    "Home services": ("home services", "గృహ సేవలు", "plumber", "electrician"),
+    "Home services": ("home services", "గృహ సేవలు", "plumber", "electrician", "appliance repair", "AC repair", "pest control", "home cleaning", "carpenter"),
     "Event services": ("event planner", "ఈవెంట్ ప్లానర్", "catering", "decorators"),
     "Other businesses": ("local business", "స్థానిక వ్యాపారం", "business services", "local shop"),
 }
@@ -133,6 +133,10 @@ def profile_url(value, platform):
         page = re.fullmatch(r"(?:people|pages)/[a-z0-9_.-]+/([0-9]{5,24})", slug)
         if page:
             return f"https://www.facebook.com/profile.php?id={page[1]}"
+        page = re.fullmatch(r"p/[a-z0-9_.-]+-([0-9]{5,24})", slug)
+        if page:
+            return f"https://www.facebook.com/profile.php?id={page[1]}"
+        slug = slug.removeprefix("pg/")
     if not re.fullmatch(r"[a-z0-9_.-]{2,100}", slug) or slug in RESERVED[host]:
         return ""
     return f"https://www.{host}/{slug}/"
@@ -222,13 +226,18 @@ def inspect_social(item, platform, category, city, local_city, custom):
     if not name:
         return None, "Missing business name"
     evidence = f"{title} {snippet}"
+    # Separated words in a public profile handle can supply context absent from an abbreviated snippet.
+    handle = urlsplit(link).path.strip("/")
+    searchable = f"{evidence} {re.sub(r'[_.-]+', ' ', handle)}"
     terms = (*CATEGORIES[category], *TELUGU_TERMS[category], custom.strip())
-    if not BUSINESS.search(evidence) and not any(has_term(evidence, term) for term in terms):
+    if not BUSINESS.search(evidence) and not any(
+        has_term(searchable, term) or (term.isascii() and has_term(searchable, term + "s")) for term in terms if term
+    ):
         return None, "Missing business category evidence"
     match = re.search(r"(?:\b(?:official\s+)?website|వెబ్‌సైట్)\s*[:–-]?\s*(https?://[^\s<>]+)", snippet, re.I)
     website = match[1].rstrip(".,;!)]") if match else ""
     return Candidate(name, link, website if website_domain(website) else "",
-                     extract_contacts(evidence), link, city_matches(evidence, city, local_city)), ""
+                     extract_contacts(evidence), link, city_matches(searchable, city, local_city)), ""
 
 
 def business_result(item, platform, category, city, local_city, custom):
