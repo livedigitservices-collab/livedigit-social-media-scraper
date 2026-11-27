@@ -22,7 +22,7 @@ def test_normalize_mobile(raw, expected):
 
 def test_only_labeled_phones_and_explicit_whatsapp():
     assert extract_contacts("Booking ref 9876543210").has_number is False
-    assert extract_contacts("Phone: 040 98765432 | owner mobile: 9876543210").has_number is False
+    assert extract_contacts("Phone: 040 98765432 | owner mobile: 9876543210") == Contacts(landline="+914098765432")
     assert extract_contacts("ఫోన్: +91 98765-43210 | WhatsApp: 8765432109 | info@example.org") == Contacts(
         "+919876543210", "+918765432109", "info@example.org",
     )

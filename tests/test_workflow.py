@@ -71,9 +71,10 @@ def test_paginated_search_dedupes_numbers_and_urls_and_persists(tmp_path):
 
 def test_enrichment_and_credit_limit_preserve_partial_leads(tmp_path):
     store = Store(tmp_path / "leads.sqlite3")
-    settings = Settings("mock-key", credit_limit=2, interval=0)
+    settings = Settings("mock-key", credit_limit=3, interval=0)
     session = Session(
-        Response([item("Instagram", "jasmine", "Guntur restaurant")]),
+        Response([item("Instagram", "jasmine", "Guntur restaurant"), item("Instagram", "lotus", "Guntur cafe", "Lotus Cafe")]),
+        Response([]),
         Response([{"link": "https://jasminecafe.example", "title": "Jasmine Cafe", "snippet": "Guntur"}]),
     )
 
@@ -85,9 +86,9 @@ def test_enrichment_and_credit_limit_preserve_partial_leads(tmp_path):
     spec = Search("Andhra Pradesh", "Guntur", "Restaurants", ("Instagram",), ("English",), pages=2, discover_websites=True)
     search_id, status = run_search(spec, settings, store, serper=Serper(settings, store, session), reader=Reader())
     assert status.startswith("Stopped")
-    assert len(session.calls) == 2
-    assert store.rows(search_id)[0]["source"] == "https://jasminecafe.example/contact"
-    assert store.rows(search_id)[0]["whatsapp"] == "+919876543210"
+    assert len(session.calls) == 3
+    assert store.rows(search_id, contacts_only=True)[0]["source"] == "https://jasminecafe.example/contact"
+    assert store.rows(search_id, contacts_only=True)[0]["whatsapp"] == "+919876543210"
 
 
 def test_target_and_provider_error(tmp_path):
@@ -124,13 +125,15 @@ def test_streamlit_search_and_results(tmp_path, monkeypatch):
     monkeypatch.setattr("requests.sessions.Session.post", lambda self, *args, **kwargs: session.post(*args, **kwargs))
     app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "app.py")).run()
     assert not app.exception
-    app.multiselect[0].set_value(["Instagram"])
-    app.multiselect[1].set_value(["English"])
+    app.selectbox(key="search_mode").set_value("Instagram businesses")
+    app.multiselect[0].set_value(["English"])
+    app.slider[0].set_value(1)
     app.button[0].click().run()
     assert not app.exception
     assert len(session.calls) == 1
     assert app.metric[0].value == "1"
-    assert app.dataframe[0].value.iloc[0]["Business name"] == "Jasmine Cafe"
+    assert any("Business name" in grid.value and grid.value.iloc[0]["Business name"] == "Jasmine Cafe"
+               for grid in app.dataframe)
     assert app.get("download_button")[0].label == "Download Excel"
 
 
