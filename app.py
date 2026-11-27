@@ -7,9 +7,9 @@ import sqlite3
 import pandas as pd
 import streamlit as st
 
-from livedigit.discovery import CATEGORIES, LOCATIONS, SOCIAL
+from livedigit.discovery import CATEGORIES, LOCATIONS
 from livedigit.export import csv_bytes, excel_bytes, table
-from livedigit.search import Search, SearchError, Settings, run_search
+from livedigit.search import LANGUAGES, MODES, Search, SearchError, Settings, run_search
 from livedigit.store import Store
 
 st.set_page_config(page_title="LiveDigit Social Media Lead Finder", page_icon="📍", layout="wide")
@@ -43,15 +43,29 @@ with st.sidebar:
     state = st.selectbox("State", list(LOCATIONS))
     city = st.selectbox("City", [*LOCATIONS[state], "Custom location"])
     custom_city = st.text_input("Custom city or town", max_chars=80) if city == "Custom location" else city
-    with st.form("search"):
-        category = st.selectbox("Business category", list(CATEGORIES))
-        platforms = st.multiselect("Platforms", list(SOCIAL), default=list(SOCIAL))
-        languages = st.multiselect("Languages", ["English", "Telugu"], default=["English", "Telugu"])
-        keyword = st.text_input("Custom keyword", max_chars=100)
-        pages = st.slider("Pages per query", 1, 5, 1)
-        website_lookup = st.checkbox("Look up official websites", help="A website lookup uses one additional Serper request per eligible profile.")
-        st.caption("Each platform, language, and page combination uses one Serper request.")
-        submitted = st.form_submit_button("Find businesses", type="primary", disabled=not settings.key)
+    category = st.selectbox("Business category", list(CATEGORIES))
+    mode = st.selectbox("Search mode", list(MODES), index=3, key="search_mode")
+    languages = st.multiselect("Languages", LANGUAGES, default=LANGUAGES)
+    keyword = st.text_input("Custom keyword", max_chars=100)
+    variants = st.slider("Query variants per source and language", 1, 3, 2)
+    pages = st.slider("Pages per query", 1, 5, 1)
+    lookup = st.checkbox("Look up missing official websites")
+    lookup_limit = st.slider("Maximum additional website lookups", 1, 20, 5) if lookup else 0
+    spec = Search(state, custom_city.strip(), category, MODES[mode], tuple(languages),
+                  keyword.strip(), pages, lookup, variants, lookup_limit)
+    ready = bool(spec.city and spec.languages)
+    if ready:
+        estimated = spec.estimated_requests()
+        remaining = max(0, settings.credit_limit - store.today()[1])
+        st.caption(f"Estimated upper bound {estimated} request credits, with {remaining} remaining today. "
+                   "Empty or repeated pages can reduce usage.")
+        with st.expander("Preview search queries"):
+            st.dataframe(
+                [{"Source": platform, "Language": language, "Query": query}
+                 for platform, language, query in spec.queries()],
+                hide_index=True, width="stretch",
+            )
+    submitted = st.button("Find businesses", type="primary", disabled=not (settings.key and ready))
     if not settings.key:
         st.info("Add SERPER_API_KEY in your environment to enable searches.")
 
@@ -62,11 +76,8 @@ if submitted:
         bar.progress(min(done / total, 1.0), text=message)
 
     try:
-        search_id, status = run_search(
-            Search(state, custom_city.strip(), category, tuple(platforms), tuple(languages),
-                   keyword.strip(), pages, website_lookup),
-            settings, store, progress,
-        )
+        search_id, status = run_search(spec, settings, store, progress)
+        st.session_state["diagnostic_view"] = search_id
         st.session_state["lead_view"] = search_id
         if status == "Completed":
             st.success("Search complete.")
@@ -88,7 +99,7 @@ profiles_today, credits_today = store.today()
 st.caption(f"Today (India time) · {profiles_today:,}/{settings.daily_target:,} new profiles · "
            f"{credits_today:,}/{settings.credit_limit:,} API requests. Provider billing may differ.")
 
-results_tab, history_tab = st.tabs(["Business leads", "Search history"])
+results_tab, diagnostics_tab, history_tab = st.tabs(["Business leads", "Search diagnostics", "Search history"])
 history = store.history()
 with results_tab:
     options = {0: "All searches", **{row["id"]: f'{row["description"]} · {row["started"][:16].replace("T", " ")} · #{row["id"]}'
@@ -104,7 +115,8 @@ with results_tab:
         st.dataframe(
             frame, hide_index=True, width="stretch",
             column_config={label: st.column_config.LinkColumn(label) for label in
-                           ("Instagram URL", "Facebook URL", "Website", "Contact source URL", "WhatsApp source URL", "Email source URL")},
+                           ("Instagram URL", "Facebook URL", "Google Maps listing URL", "Website",
+                            "Contact source URL", "WhatsApp source URL", "Email source URL", "Landline source URL")},
         )
         excel, csv = st.columns(2)
         with excel:
@@ -112,7 +124,43 @@ with results_tab:
                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary")
         with csv:
             st.download_button("Download CSV", lambda: csv_bytes(frame), "livedigit-leads.csv", "text/csv")
-    st.caption("Location and category are based on search evidence. A valid mobile format does not verify ownership.")
+    st.caption("Location and category are based on search evidence. Valid number formats do not verify ownership.")
+
+with diagnostics_tab:
+    if not history:
+        st.info("Run a search to see discovery and contact collection statistics.")
+    else:
+        by_id = {row["id"]: row for row in history}
+        if st.session_state.get("diagnostic_view") not in by_id:
+            st.session_state["diagnostic_view"] = next(iter(by_id))
+        selected = st.selectbox("Search to inspect", list(by_id), key="diagnostic_view",
+                                format_func=lambda value: f"#{value} · {by_id[value]['description']}")
+        stats = store.diagnostics(selected)
+        businesses = store.rows(selected)
+        contacts = sum(bool(row["mobile"] or row["whatsapp"] or row["landline"]) for row in businesses)
+        st.caption(by_id[selected]["status"])
+        for column, (label, value) in zip(st.columns(4), (
+            ("Raw search results", stats.get("raw", "—")),
+            ("Accepted profiles/listings", stats.get("accepted", "—")),
+            ("Rejected results", sum(count for label, count in stats.items() if label.startswith("Rejected:")) if stats else "—"),
+            ("API errors", stats.get("api_errors", "—")),
+        )):
+            column.metric(label, value)
+        for column, (label, value) in zip(st.columns(3), (
+            ("Businesses with contact numbers", contacts),
+            ("API credits attempted", by_id[selected]["credits"]),
+            ("Contact collection rate", f"{contacts / len(businesses):.1%}" if businesses else "—"),
+        )):
+            column.metric(label, value)
+        reasons = [{"Reason": label.removeprefix("Rejected: "), "Results": count}
+                   for label, count in sorted(stats.items()) if label.startswith("Rejected:")]
+        if reasons:
+            st.dataframe(reasons, hide_index=True, width="stretch")
+        if stats:
+            st.caption("Raw results cover discovery pages. The contact rate uses deduplicated businesses "
+                       "currently linked to the search. Request counts estimate credits.")
+        else:
+            st.caption("Raw results and rejection reasons were not recorded for Phase 1 searches.")
 
 with history_tab:
     if history:

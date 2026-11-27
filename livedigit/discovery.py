@@ -6,7 +6,7 @@ import socket
 import time
 from dataclasses import dataclass
 from html.parser import HTMLParser
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 from urllib.robotparser import RobotFileParser
 
 import certifi
@@ -33,7 +33,7 @@ CATEGORIES = {
     "Fitness": ("gym", "జిమ్", "fitness"),
     "Home services": ("home services", "గృహ సేవలు", "plumber", "electrician"),
     "Event services": ("event planner", "ఈవెంట్ ప్లానర్", "catering", "decorators"),
-    "Other businesses": ("local business", "స్థానిక వ్యాపారం"),
+    "Other businesses": ("local business", "స్థానిక వ్యాపారం", "business services", "local shop"),
 }
 STATE_TELUGU = {"Andhra Pradesh": "ఆంధ్రప్రదేశ్", "Telangana": "తెలంగాణ"}
 SOCIAL = {"Instagram": "instagram.com", "Facebook": "facebook.com"}
@@ -49,7 +49,7 @@ BUSINESS = re.compile(
     r"\b(business|official|shop|store|clinic|studio|branch|bookings?|orders?|services?)\b|వ్యాపారం|దుకాణం",
     re.I,
 )
-PHONE_PATTERN = r"(?<![\w+\d])(?:(?:\+?91|0)[ -]?)?[6-9](?:[ -]?\d){9}(?![\w\d]|[ -]+\d)"
+PHONE_PATTERN = r"(?<![\w+0-9])\(?\+?[0-9][0-9() .-]{7,23}[0-9](?![\w0-9]|[ .-]+[0-9])"
 WHATSAPP = r"(?:whats\s*app|వాట్సాప్|వాట్సప్)"
 CONTACT = r"(?:contact(?:\s+(?:us|number|no\.?))?|call(?:\s+us)?|phone|mobile|tel|bookings?|reservations?|orders?|enquiries|సంప్రదించండి|ఫోన్|మొబైల్)"
 LABEL_JOIN = r"\s*[:=–—-]?\s*"
@@ -62,41 +62,56 @@ class Contacts:
     mobile: str = ""
     whatsapp: str = ""
     email: str = ""
+    landline: str = ""
 
     @property
     def has_number(self):
-        return bool(self.mobile or self.whatsapp)
+        return bool(self.mobile or self.whatsapp or self.landline)
 
     @property
     def present(self):
         return self.has_number or bool(self.email)
 
 
+def phone_digits(value):
+    if not re.fullmatch(r"[+0-9 ().-]+", value):
+        return ""
+    return re.sub(r"[ ().-]", "", value)
+
+
 def normalize_mobile(value):
     """Return E.164 for a format-valid Indian mobile number."""
-    if not re.fullmatch(r"[+0-9 -]+", value):
-        return ""
-    compact = re.sub(r"[ -]", "", value)
-    match = re.fullmatch(r"(?:(?:\+?91|0))?([6-9][0-9]{9})", compact)
+    match = re.fullmatch(r"(?:(?:\+?91|0))?([6-9][0-9]{9})", phone_digits(value))
+    return "+91" + match[1] if match else ""
+
+
+def normalize_landline(value):
+    """Keep national-length fixed lines only when an Indian prefix is explicit."""
+    match = re.fullmatch(r"(?:\+91(?:0)?|0)([1-5][0-9]{9})", phone_digits(value))
     return "+91" + match[1] if match else ""
 
 
 def extract_contacts(value):
     text = " ".join(value.split())
-    # Exclude explicitly personal contact labels before looking for business contacts.
     text = re.sub(PERSONAL_CONTACT.pattern + r"[^,;|•]{0,100}", " ", text, flags=re.I)
-
-    def labeled_number(label):
-        prefix = rf"(?<!\w){label}(?!\w)(?:\s+(?:number|no\.?))?{LABEL_JOIN}"
-        match = re.search(prefix + f"({PHONE_PATTERN})", text, re.I)
-        return normalize_mobile(match[1]) if match else ""
-
-    whatsapp = labeled_number(WHATSAPP)
-    if not whatsapp:
-        match = re.search(r"https://(?:wa\.me/|api\.whatsapp\.com/send\?phone=)([0-9]{12})(?![0-9])", text, re.I)
-        whatsapp = normalize_mobile(match[1]) if match else ""
+    action = rf"(?:{CONTACT}|{WHATSAPP})"
+    combined = rf"{action}\s*(?:or|and|/|&|లేదా)\s*{action}"
+    qualifier = r"(?:\s+(?:us|on|at|now|for (?:bookings?|orders?|reservations?)|number|no\.?)){0,3}"
+    numbers = {"mobile": "", "whatsapp": "", "landline": ""}
+    pattern = rf"(?<!\w)(?P<label>{combined}|{action})(?!\w){qualifier}{LABEL_JOIN}(?P<number>{PHONE_PATTERN})"
+    for match in re.finditer(pattern, text, re.I):
+        label, raw = match["label"], match["number"]
+        if re.search(CONTACT, label, re.I):
+            numbers["mobile"] = numbers["mobile"] or normalize_mobile(raw)
+            numbers["landline"] = numbers["landline"] or normalize_landline(raw)
+        if re.search(WHATSAPP, label, re.I):
+            numbers["whatsapp"] = numbers["whatsapp"] or normalize_mobile(raw)
+    if not numbers["whatsapp"]:
+        match = re.search(r"(?<![\w./-])https://(?:wa\.me/|api\.whatsapp\.com/send\?phone=)(91[0-9]{10})(?![\w0-9])", text, re.I)
+        if match:
+            numbers["whatsapp"] = normalize_mobile(match[1])
     email = EMAIL.search(text)
-    return Contacts(labeled_number(CONTACT), whatsapp, email[0].lower() if email else "")
+    return Contacts(email=email[0].lower() if email else "", **numbers)
 
 
 def profile_url(value, platform):
@@ -110,6 +125,14 @@ def profile_url(value, platform):
     if host != SOCIAL[platform]:
         return ""
     slug = parsed.path.strip("/").lower()
+    if platform == "Facebook":
+        if slug == "profile.php":
+            ids = parse_qs(parsed.query).get("id", [])
+            if len(ids) == 1 and re.fullmatch(r"[0-9]{5,24}", ids[0]):
+                return f"https://www.facebook.com/profile.php?id={ids[0]}"
+        page = re.fullmatch(r"(?:people|pages)/[a-z0-9_.-]+/([0-9]{5,24})", slug)
+        if page:
+            return f"https://www.facebook.com/profile.php?id={page[1]}"
     if not re.fullmatch(r"[a-z0-9_.-]{2,100}", slug) or slug in RESERVED[host]:
         return ""
     return f"https://www.{host}/{slug}/"
@@ -142,35 +165,103 @@ def result_text(item, key):
     return value.strip() if isinstance(value, str) else ""
 
 
-def business_result(item, platform, category, city, local_city, custom):
+CITY_VARIANTS = {
+    "Visakhapatnam": ("Vizag", "వైజాగ్"),
+    "Rajahmundry": ("Rajamahendravaram", "రాజమహేంద్రవరం"),
+    "Nellore": ("Sri Potti Sriramulu Nellore",),
+}
+TELUGU_TERMS = {
+    "Restaurants": ("కేఫ్", "హోటల్"), "Salons": ("బ్యూటీ పార్లర్", "హెయిర్ సెలూన్"),
+    "Retail": ("షాపు", "స్టోర్"), "Clinics": ("ఆసుపత్రి", "దంత వైద్యశాల"),
+    "Fitness": ("ఫిట్‌నెస్ సెంటర్", "వ్యాయామశాల"),
+    "Home services": ("ప్లంబర్", "ఎలక్ట్రీషియన్"),
+    "Event services": ("కేటరింగ్", "డెకరేషన్"), "Other businesses": ("సేవలు", "దుకాణం"),
+}
+MAPS = "Google Maps"
+
+
+def has_term(text, term):
+    # Telugu combining marks otherwise cause word-boundary mismatches.
+    return bool(term and re.search(rf"(?<![a-z0-9]){re.escape(term.casefold())}(?![a-z0-9])", text.casefold()))
+
+
+def city_matches(value, city, local_city):
+    return any(has_term(value, form) for form in (city, local_city, *CITY_VARIANTS.get(city, ())))
+
+
+def business_key(name):
+    return "".join(character for character in name.casefold() if character.isalnum()
+                   or "\u0c00" <= character <= "\u0c7f")
+
+
+def official_domain(url):
+    return website_domain(url).removeprefix("www.")
+
+
+@dataclass(frozen=True)
+class Candidate:
+    name: str
+    url: str
+    website: str
+    contact: Contacts
+    source: str
+    location_confirmed: bool = True
+
+
+def inspect_social(item, platform, category, city, local_city, custom):
     link = profile_url(result_text(item, "link"), platform)
     title = result_text(item, "title")
     snippet = result_text(item, "snippet")
-    if not link or not title or NON_BUSINESS.search(f"{title} {snippet}"):
-        return None
-    evidence = f"{title} {snippet}".casefold()
-    category_terms = (*CATEGORIES[category], custom.strip())
-    if not BUSINESS.search(evidence) and not any(term.casefold() in evidence for term in category_terms if term):
-        return None
-    aliases = [city, local_city]
-    if city.casefold() == "rajahmundry":
-        aliases.extend(["Rajamahendravaram", "రాజమహేంద్రవరం"])
-    if city.casefold() == "visakhapatnam":
-        aliases.append("Vizag")
-    if not any(re.search(rf"(?<!\w){re.escape(alias.casefold())}(?!\w)", evidence) for alias in aliases if alias):
-        return None
-    name = re.split(r"\s+\(@|\s+[|·–—]\s+(?:Instagram|Facebook)\b|\s+-\s+(?:Instagram|Facebook)\b",
-                    title, maxsplit=1, flags=re.I)[0].strip()
+    if not link:
+        return None, "Not a business profile URL"
+    if not title:
+        return None, "Missing business name"
+    if NON_BUSINESS.search(f"{title} {snippet}"):
+        return None, "Creator or personal profile"
+    name = re.split(r"\s+\(@|\s+[|·–—-]\s+(?:Instagram|Facebook)\b", title, maxsplit=1, flags=re.I)[0].strip()
     if not name:
-        return None
-    website = ""
-    match = re.search(r"(?:\b(?:official\s+)?website|వెబ్‌సైట్)\s*[:–-]?\s*(https?://[^\s<>]+)",
-                      snippet, re.I)
-    if match:
-        candidate = match[1].rstrip(".,;!)]")
-        if website_domain(candidate):
-            website = candidate
-    return name, link, website, extract_contacts(f"{title} | {snippet}")
+        return None, "Missing business name"
+    evidence = f"{title} {snippet}"
+    terms = (*CATEGORIES[category], *TELUGU_TERMS[category], custom.strip())
+    if not BUSINESS.search(evidence) and not any(has_term(evidence, term) for term in terms):
+        return None, "Missing business category evidence"
+    match = re.search(r"(?:\b(?:official\s+)?website|వెబ్‌సైట్)\s*[:–-]?\s*(https?://[^\s<>]+)", snippet, re.I)
+    website = match[1].rstrip(".,;!)]") if match else ""
+    return Candidate(name, link, website if website_domain(website) else "",
+                     extract_contacts(evidence), link, city_matches(evidence, city, local_city)), ""
+
+
+def business_result(item, platform, category, city, local_city, custom):
+    candidate, _ = inspect_social(item, platform, category, city, local_city, custom)
+    if candidate and candidate.location_confirmed:
+        return candidate.name, candidate.url, candidate.website, candidate.contact
+    return None
+
+
+def inspect_place(item, city, local_city):
+    name, address = result_text(item, "title"), result_text(item, "address")
+    if not name or not address:
+        return None, "Missing listing name or address"
+    if not city_matches(address, city, local_city):
+        return None, "Listing address outside requested locality or missing locality evidence"
+    if NON_BUSINESS.search(f"{name} {result_text(item, 'category')}"):
+        return None, "Creator or personal profile"
+    cid = str(item.get("cid", ""))
+    place_id = result_text(item, "placeId")
+    query = {"api": 1, "query": f"{name}, {address}"}
+    stable_place_id = bool(re.fullmatch(r"[A-Za-z0-9_-]{8,200}", place_id))
+    stable_cid = bool(re.fullmatch(r"[0-9]{1,24}", cid))
+    if stable_place_id:
+        query["query_place_id"] = place_id
+    if stable_cid:
+        link = "https://www.google.com/maps?" + urlencode({"cid": cid})
+    else:
+        link = "https://www.google.com/maps/search/?" + urlencode(query)
+    website = result_text(item, "website")
+    phone = result_text(item, "phoneNumber")
+    contact = (Contacts(mobile=normalize_mobile(phone), landline=normalize_landline(phone))
+               if stable_cid or stable_place_id else Contacts())
+    return Candidate(name, link, website if website_domain(website) else "", contact, link), ""
 
 
 class BusinessHTML(HTMLParser):
